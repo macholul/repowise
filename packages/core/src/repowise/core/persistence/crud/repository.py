@@ -6,13 +6,15 @@ every public name, so existing imports are unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...git_head import read_head_commit
+from ...forges import read_remote_url, strip_credentials
+from ...git_head import read_head_commit, resolve_git_dir
 from ..models import (
     GenerationJob,
     Page,
@@ -34,8 +36,8 @@ async def upsert_repository(
     *,
     name: str,
     local_path: str,
-    url: str = "",
-    default_branch: str = "main",
+    url: str | None = None,
+    default_branch: str | None = None,
     settings: dict | None = None,
     head_commit: str | None = None,
     stamp_head: bool = False,
@@ -50,6 +52,16 @@ async def upsert_repository(
     canonical row in the repo-local ``wiki.db``; both must share one id so
     per-repo session routing keyed by that id resolves consistently. Ignored
     when a row for ``local_path`` already exists (the existing id wins).
+
+    ``url``, ``default_branch`` and ``settings`` overwrite an existing row only
+    when passed; ``None`` keeps the stored value, so a command that only needs
+    the row never resets a ``master`` branch to ``main``. Pass ``""`` to clear
+    the url. An empty branch counts as not passed, since a repository always
+    has one. When the call creates the row or records a sync and leaves either
+    one unset, it is read from git: the remote url (``origin``, else
+    ``upstream``) with credentials removed, and the default branch. A value
+    git cannot give keeps the stored one, and a new row defaults to ``""``
+    and ``"main"``.
 
     ``head_commit`` records the git commit the index was built against — the
     value the MCP ``_meta`` freshness check compares to the live HEAD. A new
@@ -67,22 +79,29 @@ async def upsert_repository(
 
     stamping = repo is None or stamp_head or head_commit is not None
     resolved_head = (head_commit or _read_head_commit(local_path)) if stamping else None
+    if stamping and (url is None or not default_branch):
+        # Off the event loop: the branch read runs git, and the server awaits this.
+        git_url, git_branch = await asyncio.to_thread(_read_git_remote, local_path)
+        url = git_url if url is None else url
+        default_branch = default_branch or git_branch
 
     if repo is None:
         repo = Repository(
             id=repo_id or _new_uuid(),
             name=name,
             local_path=local_path,
-            url=url,
-            default_branch=default_branch,
+            url=url or "",
+            default_branch=default_branch or "main",
             settings_json=json.dumps(settings or {}),
             head_commit=resolved_head,
         )
         session.add(repo)
     else:
         repo.name = name
-        repo.url = url
-        repo.default_branch = default_branch
+        if url is not None:
+            repo.url = url
+        if default_branch:
+            repo.default_branch = default_branch
         if settings is not None:
             repo.settings_json = json.dumps(keep_analysis_ran(repo.settings_json, settings))
         # Only advance the stamp when we could read a real commit; never blank
@@ -168,6 +187,19 @@ def _read_head_commit(local_path: str) -> str | None:
     commit already stored.
     """
     return read_head_commit(local_path)
+
+
+def _read_git_remote(local_path: str) -> tuple[str | None, str | None]:
+    """``(remote url without credentials, default branch)``, ``None`` where git has no answer."""
+    git_dir = resolve_git_dir(local_path)
+    # Without a HEAD git would search parent directories and answer for another repo.
+    if git_dir is None or not (git_dir / "HEAD").is_file():
+        return None, None
+    # Deferred: git_refs pulls in the change-risk stack, which a session open never needs.
+    from ...git_refs import default_branch
+
+    remote = read_remote_url(local_path)
+    return (strip_credentials(remote) if remote else None), default_branch(local_path)
 
 
 async def set_repo_function_mod_p80(session: AsyncSession, repo_id: str, value: int) -> None:

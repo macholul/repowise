@@ -22,9 +22,11 @@ Everything Repowise knows about your repository, created at the repo root by
 └── .env                 # API keys (gitignored automatically)
 ```
 
-Repowise adds `.repowise/` to `.gitignore`: it is a local cache, not a source
-of truth. Only [`decisions.yaml`](#repowisedecisionsyaml) is meant to be
-committed.
+`.repowise/` is a local cache, not a source of truth: add it to your
+`.gitignore` if you like, as Repowise does not edit that file during `init`. Only
+[`decisions.yaml`](#repowisedecisionsyaml) is meant to be committed. The secrets
+`.env` and `events.key` are ignored by `.repowise/.gitignore`, so they stay out
+of git even where `.repowise/` is committed.
 
 ## `config.yaml`
 
@@ -260,6 +262,7 @@ overrides a key for one session.
 | `read_reread` | `false` | Serve an unchanged repeat Read as a short notice. |
 | `search_digest` | `false` | Serve multi-file grep floods as a digest. |
 | `coverage_reingest` | `false` | Re-ingest coverage after an agent's full test run, at a process start per shell command ([test intelligence](../layers/TEST_INTELLIGENCE.md)). |
+| `health_gate` | `false` | Block an agent's `git commit` / `git push` that fails `repowise health check`; set with `repowise hook health-gate install` ([CI](../start/CI.md#before-an-agent-commits-or-pushes)). |
 
 **`read_skeleton`**
 
@@ -364,8 +367,8 @@ decisions:
 | `discovery.max_sessions` | `12` | Per discovery pass, 1-24. |
 | `discovery.max_input_tokens` | `30000` | Per discovery pass, 2000-60000. |
 | `harnesses` | `[claude_code]` | Whose transcripts the session lane reads; add `codex`. |
-| `agent_acceptance` | `false` | Whether an agent may grant a decision authority. |
-| `capture_prompt` | `false` | Ask the agent to record what it just committed. |
+| `agent_acceptance` | `true` | Whether an agent may grant a decision authority, signed as itself. |
+| `capture_prompt` | `true` | Ask the agent to record what it just committed. |
 
 ### Sources
 
@@ -406,21 +409,22 @@ is the one switch proving no extraction reaches a model.
 
 ### `agent_acceptance` and `capture_prompt`
 
-Neither is about capture; both ship off and no preset enables them.
+Neither is about capture, and no preset changes them.
 
-- `agent_acceptance` off: an agent can propose and withdraw authority, never
-  grant it. On: it may accept, recorded as an agent's with the signing
-  session, on every surface, never as yours.
-- `capture_prompt` on: a successful `git commit` with two or more decision
-  signals prompts the agent, once per session, to run `repowise decision add`;
-  never for a commit a record already cites, and only as a proposal. An agent
-  cannot decline a hook, hence off by default.
-- `repowise decision config capture-prompt --on` also adds a separate
-  `Bash|PowerShell` PostToolUse entry (the shared matcher excludes shell tools:
-  51% of hook invocations for 0.7% of emissions); `--off` removes it.
-- That entry is per install: other repositories pay a process start on shell
-  calls and emit nothing unless enabled, and switching it off here turns it off
-  for all.
+- `agent_acceptance` on (default): an agent may accept, recorded as an
+  agent's with the signing session, on every surface, never as yours. Off: an
+  agent can propose and withdraw authority, never grant it. `false` is written
+  to the config so it survives a reload.
+- `capture_prompt` on (default): a successful `git commit` with two or more
+  decision signals prompts the agent, once per session, to run
+  `repowise decision add`; never for a commit a record already cites, and only
+  as a proposal. `false` is written to the config so it survives a reload.
+- It fires from a separate `Bash|PowerShell` PostToolUse entry, which `init`
+  and the Claude Code plugin install. The entry tests the payload for
+  `git commit` in the shell, so other shell calls never start Python.
+- `repowise decision config capture-prompt --off` switches the prompt off for
+  one repository and leaves the per-install entry, which stays silent there.
+  `--on` reinstalls the entry if it is missing.
 
 ### From the CLI
 
@@ -1044,6 +1048,7 @@ Anonymous usage telemetry is **on by default** (opt-out).
 |----------|-------------|
 | `DO_NOT_TRACK` | Any truthy value disables it (cross-tool convention) |
 | `REPOWISE_TELEMETRY_DISABLED` | Disables it, Repowise-specific |
+| `REPOWISE_OFFLINE` | Disables it, plus the PyPI release check and the `init` probe of signed-in agent CLIs (`DO_NOT_TRACK` and `REPOWISE_TELEMETRY_DISABLED` turn those off too) |
 | `REPOWISE_TELEMETRY_DEBUG` | Prints the payload to stderr instead of sending |
 
 ### Misc

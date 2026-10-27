@@ -236,14 +236,148 @@ async def test_stats_file_count_excludes_symbol_nodes(client: AsyncClient, sessi
                 )
             )
         session.add_all(make_wiki_symbol(repo.id, f"src/mod{i}.py", f"sym{j}") for j in range(5))
+    # Import targets are file rows too: a third-party package and a path an
+    # import names that traversal never parsed.
+    for node_id, language in [("external:requests", "external"), ("src/generated", "unknown")]:
+        session.add(
+            GraphNode(repository_id=repo.id, node_id=node_id, node_type="file", language=language)
+        )
     await session.commit()
 
     data = (await client.get(f"/api/repos/{repo.id}/stats")).json()
     overview = (await client.get(f"/api/repos/{repo.id}/overview-summary")).json()
     symbols = (await client.get("/api/symbols", params={"repo_id": repo.id})).json()
 
-    assert data["file_count"] == 2  # not 14
+    assert data["file_count"] == 2  # not 16, not 4
+    assert overview["stats"]["file_count"] == 2
     # One figure, the symbol index's row count: not 12 symbol nodes, not 12 emissions.
     assert data["symbol_count"] == 10
     assert overview["stats"]["symbol_count"] == 10
     assert symbols["total"] == 10
+
+
+@pytest.mark.asyncio
+async def test_create_on_a_registered_path_keeps_omitted_url_and_branch(
+    client: AsyncClient,
+) -> None:
+    repo_dir = Path(tempfile.mkdtemp()) / "legacy"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    first = {"index": False, "name": "legacy", "local_path": str(repo_dir)}
+    await client.post(
+        "/api/repos",
+        json={**first, "url": "https://github.com/acme/legacy", "default_branch": "master"},
+    )
+
+    again = await client.post("/api/repos", json={**first, "name": "renamed"})
+
+    data = again.json()
+    assert data["name"] == "renamed"
+    assert data["url"] == "https://github.com/acme/legacy"
+    assert data["default_branch"] == "master"
+
+    sent = await client.post("/api/repos", json={**first, "url": "", "default_branch": "dev"})
+    assert sent.json()["url"] == ""
+    assert sent.json()["default_branch"] == "dev"
+
+
+@pytest.mark.asyncio
+async def test_indexed_create_on_a_registered_path_keeps_omitted_fields_in_both_rows(
+    client: AsyncClient, app, tmp_path, monkeypatch
+) -> None:
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Repository
+    from repowise.server.routers import repos as repos_module
+
+    async def _noop(job_id, app_state, session_factory_override=None):
+        return None
+
+    monkeypatch.setattr(repos_module, "execute_job", _noop)
+    repo_dir = tmp_path / "legacy"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    body = {"name": "legacy", "local_path": str(repo_dir), "index": True}
+    await client.post(
+        "/api/repos",
+        json={**body, "url": "https://github.com/acme/legacy", "default_branch": "master"},
+    )
+
+    data = (await client.post("/api/repos", json=body)).json()
+
+    assert (data["url"], data["default_branch"]) == ("https://github.com/acme/legacy", "master")
+    async with app.state.session_factory() as session:
+        row = (await session.execute(select(Repository))).scalar_one()
+    assert (row.url, row.default_branch) == ("https://github.com/acme/legacy", "master")
+
+
+@pytest.mark.asyncio
+async def test_indexed_create_after_a_metadata_only_one_keeps_its_fields(
+    client: AsyncClient, app, tmp_path, monkeypatch
+) -> None:
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Repository
+    from repowise.server.routers import repos as repos_module
+
+    async def _noop(job_id, app_state, session_factory_override=None):
+        return None
+
+    monkeypatch.setattr(repos_module, "execute_job", _noop)
+    repo_dir = tmp_path / "legacy"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    body = {"name": "legacy", "local_path": str(repo_dir)}
+    await client.post(
+        "/api/repos",
+        json={
+            **body,
+            "index": False,
+            "url": "https://github.com/acme/legacy",
+            "default_branch": "master",
+        },
+    )
+
+    data = (await client.post("/api/repos", json={**body, "index": True})).json()
+
+    assert (data["url"], data["default_branch"]) == ("https://github.com/acme/legacy", "master")
+    async with app.state.session_factory() as session:
+        row = (await session.execute(select(Repository))).scalar_one()
+    assert (row.url, row.default_branch) == ("https://github.com/acme/legacy", "master")
+
+
+def _checkout(root: Path, branch: str) -> Path:
+    import subprocess
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    root.mkdir()
+    git("init", "-b", branch)
+    git("remote", "add", "origin", f"https://user:ghp_secret@github.com/acme/{root.name}.git")
+    (root / "a.txt").write_text("a\n", encoding="utf-8")
+    git("add", "a.txt")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "a")
+    return root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [False, True])
+async def test_create_without_url_or_branch_reads_them_from_git(
+    client: AsyncClient, tmp_path, monkeypatch, index: bool
+) -> None:
+    from repowise.server.routers import repos as repos_module
+
+    async def _noop(job_id, app_state, session_factory_override=None):
+        return None
+
+    monkeypatch.setattr(repos_module, "execute_job", _noop)
+    root = _checkout(tmp_path / "legacy", "master")
+
+    body = {"name": "legacy", "local_path": str(root), "index": index}
+    data = (await client.post("/api/repos", json=body)).json()
+
+    assert (data["url"], data["default_branch"]) == (
+        "https://github.com/acme/legacy.git",
+        "master",
+    )

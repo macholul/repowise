@@ -184,6 +184,7 @@ Per target, under `targets`:
 | title, summary, symbols | Docs summary and symbols with signatures and lines |
 | `symbols_truncated`, `symbols_total` | Compact card: `{shown, total, hint}` and the full count |
 | `hotspot` | Churn flag |
+| `hotspot_files` | Directory card: hotspot files under it, absent at zero |
 | `fix_history` | Files with counted bug fixes: `fix_count` over `window` (6 months), age, `bug_magnet`. A cue to call `get_risk` |
 | `episodes` | Count of dated records; `get_why` serves them |
 | decisions | Titles; with `include=["decisions"]` the lanes `decisions`, `candidates` (max 3), `history` (max 2) |
@@ -205,7 +206,7 @@ Top level: `targets`, `_meta`, `ignored_arguments`, `suspects` when asked, and `
 | `include` | Adds |
 |-----------|------|
 | `full_doc` | `content_md`, plus `digest_md` (questions answered, concept index, public API, git signals); dropped first over budget |
-| `ownership` | Primary owner, bus factor, contributor count |
+| `ownership` | Primary owner, bus factor, contributor count; on a directory, `owners_by_files` (top 3, `owners_total` beyond) and `basis` |
 | `last_change`, `community` | Newest change; community |
 | `callers`, `callees` | Call-graph neighbours |
 | `references` | Symbol edit set; see [references](#references) |
@@ -370,7 +371,7 @@ Per file:
 | `changes` | `recent_changes`, `recent_changes_total`, as in [get_context](#changes) |
 | `tests` | Typed `test_recommendations` |
 | `blast` | `pr_blast_radius`: transitive files, co-change warnings, test gaps, structural score; reviewers stay in the directive |
-| `graph` | `dependents` (direct vs transitive), `consumers` (typed contract consumers), `cross_repo_links`, `impact_surface`, `direct_risks`, `relationship_analysis` (empty vs unavailable or partial) |
+| `graph` | `dependents` (direct vs transitive), `consumers` (typed contract consumers), `cross_repo_links` (contract rows carry `strategy` and `origin`, see [cross-repo link rows](#cross-repo-link-rows)), `impact_surface`, `direct_risks`, `relationship_analysis` (empty vs unavailable or partial) |
 | `churn` | `change_magnitude`, `risk_type`, `change_pattern` |
 | `scales` | Unit, range and calibration per scalar; identical every call |
 
@@ -405,7 +406,7 @@ Notes:
 - **Measured `test_recommendations`** match a changed file, not its lines (`evidence[].match: "file"`); a test file gone or changed since measurement carries `stale: true` and `stale_reason`.
 - **`reach`:** bands an uncalibrated 0 to 10 heuristic that never sees the diff; not a probability. The raw `pr_blast_radius.structural_impact_score` needs `include=["blast", "scales"]`.
 
-In workspace mode the directive adds `will_break_consumers` (structural reach only), `missing_cross_repo_cochanges`, `breaking_changes` (provider incompatibilities since the last index with impacted consumers; a link does not prove field use), `conformance_violations` and `dependency_cycles`; dropped when no workspace is loaded.
+In workspace mode the directive adds `will_break_consumers` (structural reach only), `missing_cross_repo_cochanges`, `breaking_changes` (provider incompatibilities since the last index with impacted consumers; a link does not prove field use), `conformance_violations` and `dependency_cycles`; dropped when no workspace is loaded. `cross_repo_relationship_analysis` carries `graph_evidence` and this repo's `http_calls`.
 
 ---
 
@@ -444,7 +445,7 @@ Both revisions are analysed from their own content; a head finding is reported o
 | `introduced`, `worsened`, `resolved` | Totals |
 | `top_findings`, `findings_total` | Three most actionable, and the count |
 | `files`, `files_total` | Up to 10 files, largest structure move first |
-| `score_basis`, `score_change` | `structure_only`; nloc-weighted score change |
+| `score_basis`, `score_change` | `structure_only` (code shape of the changed bytes, no coverage); nloc-weighted score change |
 
 Skips:
 
@@ -457,7 +458,7 @@ Findings name `dimension`, `biomarker`, `severity`, `path`, `symbol`, head-side 
 - Identity ignores line numbers, so moved code introduces nothing. Ids are bound to the two revisions; pass one as `finding_id` to expand it.
 - A match to a stored finding carries `health_reference` for `get_health(finding_id=...)`. Performance findings carry `opportunity_id`, ordered by opportunity rank.
 
-Files rows: `base_score`, `head_score`, `nloc_base`, `nloc_head` (null on a missing side); `base_structure`/`head_structure` with diagnostics. Each score is 10 minus the structure deduction, as `get_health(counts="code_shape")`, from passes reading no history or coverage. A deleted file has a base-only row, with `moved_to` when split.
+Files rows: `base_score`, `head_score`, `nloc_base`, `nloc_head` (null on a missing side); `base_structure`/`head_structure` with diagnostics. Each score is 10 minus the structure deduction of the changed files' bytes, from passes reading no history or coverage. It can differ from `get_health(counts="code_shape")`, whose structure half also counts coverage markers and clones with unchanged files. A deleted file has a base-only row, with `moved_to` when split.
 
 `score_change` (base-nloc weighted, so a growing improved file keeps its gain): `base`, `head`, `delta` (two decimals), `structure_delta` (moves even at the 1.0 floor), `files_compared`.
 
@@ -509,8 +510,9 @@ Groups changed files over index edges, co-change pairs and (for a range) shared 
 
 ### cross_repo
 
-- `consumers[]`: `provider_file`, consumer `repo`, `file`, `contract_id`, `contract_type`, `match_type`, and `tests` (`state` `measured`, `inferred`, `none` or `unresolved`; up to 5 `tests_to_run`).
+- `consumers[]`: `provider_file`, consumer `repo`, `file`, `contract_id`, `contract_type`, `match_type`, `strategy`, `origin`, and `tests` (`state` `measured`, `inferred`, `none` or `unresolved`; up to 5 `tests_to_run`).
 - `breaking_changes[]`: `contract_id`, `kind`, `severity`, `detail`, `impacted_repos`. `breaking_changes_available` says whether detection ran, so empty is not an all-clear.
+- `graph_evidence` and `http_calls` for the changed repo, as in [workspace tools](#workspace-tools).
 - Absent outside workspace mode or when no published file changed.
 
 ---
@@ -552,7 +554,7 @@ Groups changed files over index edges, co-change pairs and (for a range) shared 
 
 - **`dependencies`:** the ten heaviest package edges (`from`, `to`, `verb`, `weight`), `edges_total` when more; absent in a single-package repo.
 - **`code_health`:** `production_average` when tests are in the reading; `files_scored` when some files have no score.
-- **`next_actions`:** `include=["actions"]` serves both horizons with `done_when` and `by_tier`; `get_health(fix_id="act_...")` opens one.
+- **`next_actions`:** `include=["actions"]` serves both horizons with `done_when` and `by_tier`; `get_health(fix_id="act_...")` opens one. `unavailable` names inputs the list was built without and `unavailable_reasons` gives each one's reason; both are absent when every input was read.
 - **`repo="all"`:** each repo has `summary` (essay's first sentence), `code_files` (its `code_health.code_files`, or graph code files before health runs) and `symbol_count`; `total_code_files` sums them.
 
 Opt-in blocks, computed only when named: `outline` (page tree, two levels), `tour` (`guided_tour`, `reading_order`), `decisions` (`key_decisions`), `graph` (`community_summary`), `ownership` (`knowledge_map`), `components`, `changes`, `actions`, `tools` (`tool_surface`), `scope` (whole `_meta.index_scope`).
@@ -630,6 +632,7 @@ One ranked queue across refactoring, performance and code-shape work, the same o
 - Nothing is gated. Health is ungated on Java, C#, C and preview on C++; refactoring, performance and dead code are preview on Java, C#, C, C++ (dead code also Kotlin, Swift).
 - **Vendored and generated files:** findings held back in every language (changed upstream or by a generator), counted in `_meta.gated.health` under `vendored` and `generated`; `_meta.gated.reasons` explains once when nothing is listed. Scores, KPIs and worst-file order still count them.
 - **History markers** (ownership, churn, change entropy, co-change, other git kinds): on tests, held back under `test_history` (code-shape findings still list); elsewhere, held from finding lists under `history`, though they order hotspots and Fix first and `get_risk` lists them.
+- **`findings_hidden`** (targeted mode): one line beside `findings` when a file or row hold kept findings off it, with their count by hold and the points they still deduct. Absent when nothing is held.
 
 ### Opt-in blocks
 
@@ -700,7 +703,7 @@ Per-file `covered_line_count`, `total_coverable_lines` (targeted adds `covered_l
 | `limit_note` | A `limit` over 25 was clamped |
 
 - No language is gated; dead code on Java, C#, C, C++, Kotlin and Swift is preview, labelled in `_meta.preview`.
-- Workspace mode lowers confidence on findings another repo imports.
+- In workspace mode a finding another repo may use is never `safe_to_delete`, and a contract link to its file also lowers its confidence.
 - The 0.7 and 0.4 floors are shared by the CLI, web UI and this tool. See [DEAD_CODE.md](../layers/DEAD_CODE.md).
 
 ---
@@ -721,15 +724,21 @@ Any of `alias`, `path`, `absolute_path` passes unchanged as `repo`. Single-repo 
 
 ### `get_blast_radius`
 
-Impacted services with `score` (0 to 1 relative path weight, uncalibrated), `distance` (hops), `structural` (real dependency vs co-change only) and edge kinds; `impact_score_semantics`, `impacted_repos`, `structural_count`, `behavioral_count`, `total_impacted`, unresolved targets. `symbol_targets[].consumers[]` names consuming symbols per contract link, each with a `get_change_risk`-shaped `tests` block.
+Impacted services with `score` (0 to 1 relative path weight, uncalibrated), `distance` (hops), `structural` (real dependency vs co-change only) and edge kinds; `impact_score_semantics`, `impacted_repos`, `structural_count`, `behavioral_count`, `total_impacted`, unresolved targets. `symbol_targets[].consumers[]` names consuming symbols per contract link, with `strategy` and `origin`, each with a `get_change_risk`-shaped `tests` block. `evidence` is the graph's evidence state.
 
 ### `get_architecture`
 
-`score` (1 to 10; higher is lower coupling, smaller core), `architecture_type` (`core-periphery`, `hierarchical`), `propagation_cost_pct` (share of other services the average service reaches), `core_size`, `core_ratio`, `core_members`, `cycle_count`, `conformance_violations`, `role_breakdown` (Core, Shared, Control, Peripheral), `summary`.
+`score` (1 to 10; higher is lower coupling, smaller core), `architecture_type` (`core-periphery`, `hierarchical`), `propagation_cost_pct` (share of other services the average service reaches), `core_size`, `core_ratio`, `core_members`, `cycle_count`, `cycle_count_capped` (true when the enumeration budget stopped the count, so `cycle_count` is a floor), `conformance_violations`, `role_breakdown` (Core, Shared, Control, Peripheral), `evidence`, `http_calls`, `summary`.
+
+### Cross-repo link rows
+
+A contract link row carries `strategy`, the rule that matched it (`exact_id`, `unique_path`, `gateway_route`, `host_only` and the rest of `LinkStrategy`), and `origin`, how the contract at the row's far end was read (`route_registration`, `client_call`, `sql_string` and the rest of `ContractOrigin`). Both are omitted on an artifact written before they were stored. `match_type` derives from `strategy`, so a `unique_path` or `gateway_route` link still reads `exact` there. Values are in [WORKSPACE_CONTRACTS.md](WORKSPACE_CONTRACTS.md).
+
+`graph_evidence` is `{state, reason}`, present only when the state is `partial` or `insufficient`; `reason` lists the evidence reason codes (`isolated_services`, `repos_without_contracts` and the rest of `graph_evidence`). `http_calls` counts HTTP calls `read`, `not_linked` and `in_service`, workspace wide on `get_architecture` (which adds `linked`) and for the changed repo on `get_risk` and `get_change_risk`; calls served inside their own service are counted apart, never as not linked. The counts are separate figures, not a partition of `read`.
 
 ### `get_conformance`
 
-`violations` (`source`, `target`, `rule_source` / `rule_target`, `edge_kind`), `cycles` (`nodes`, `length`), `violation_count`, `cycle_count`, `rules_evaluated`. A report that never ran says so, not zero counts.
+`violations` (`source`, `target`, `rule_source` / `rule_target`, `edge_kind`), `cycles` (`nodes`, `length`), `violation_count`, `cycle_count`, `total_cycles`, `total_capped` (true when `total_cycles` is "at least"), `rules_evaluated`. A report that never ran says so, not zero counts.
 
 ### `get_dependency_path`
 

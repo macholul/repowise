@@ -73,10 +73,13 @@ def _text(a: Action) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_fragile_without_coverage_says_add_tests_and_basis_unknown() -> None:
+def test_fragile_without_coverage_states_graph_absence_and_basis_unknown() -> None:
     out = _run(code.fragile_file, _facts([_file("src/a.py")]))
     (a,) = out.actions
-    assert a.title.startswith("Add tests around `src/a.py`")
+    assert a.title == (
+        "No test reaches `src/a.py` in the code graph: "
+        "confirm it is tested before its next change"
+    )
     cov = next(w for w in a.why if w.label == "line coverage")
     assert cov.basis == "unknown"
     assert a.confidence == "medium"
@@ -246,7 +249,8 @@ def test_code_shape_from_the_week_is_one_maintainability_item_to_plan() -> None:
     )
     for subset in (found, found[:1]):
         (a,) = _run(code.fresh_regressions, _facts(recent_findings=subset)).actions
-        assert (a.tier, a.severity, a.effective_value) == ("plan", "medium", SEVERITY_VALUE["medium"])
+        # Its severity is its evidence's, held at high; its value keeps it below defects.
+        assert (a.tier, a.severity, a.effective_value) == ("plan", "high", SEVERITY_VALUE["medium"])
         assert a.horizons == ("week",)
         assert dict((w.label, w.value) for w in a.why)["code-shape findings"] == str(len(subset))
     (single,) = _run(code.fresh_regressions, _facts(recent_findings=found[:1])).actions
@@ -361,8 +365,8 @@ def test_a_folder_names_its_first_step() -> None:
     (a,) = _run(code.fix_concentration, _concentration_facts()).actions
     # Every file here is untested; the most fixed one comes first.
     assert a.title == (
-        "Stabilise `pkg/cli/update/`: first, add tests around `pkg/cli/update/a0.py` "
-        "before its next change"
+        "Stabilise `pkg/cli/update/`: first, no test reaches `pkg/cli/update/a0.py` "
+        "in the code graph: confirm it is tested before its next change"
     )
     assert "10 of the 25 bug-fix commits" in a.impact
 
@@ -433,6 +437,34 @@ def test_fix_first_emits_now_and_next_and_leaves_later() -> None:
     assert actions[0].surface == "performance"
     assert actions[1].commands[0].mcp == f'get_health(fix_id="{items[1].id}")'
     assert len({a.action_id for a in actions}) == 2
+
+
+def test_a_fix_first_row_reads_its_findings_severity() -> None:
+    """GraphFlow's row said medium while its own severity fact said high."""
+    from repowise.core.analysis.health.fix_first.model import FixFact
+
+    item = _fix_items()[0]
+    for fact, tier, expected in (
+        ("high", "next", "high"),
+        ("critical", "now", "high"),
+        ("medium", "now", "medium"),
+        (None, "next", "medium"),
+        (None, "now", "high"),
+    ):
+        facts = (FixFact("severity", fact),) if fact else ()
+        (a,) = _run(code.fix_first, _facts(fix_first=(replace(item, tier=tier, facts=facts),))).actions
+        assert a.severity == expected, (fact, tier)
+        if fact:
+            assert dict((w.label, w.value) for w in a.why)["severity"] == fact
+
+
+def test_a_regression_row_reads_its_findings_severity() -> None:
+    def severity(*found: RecentFinding) -> str:
+        return _run(code.fresh_regressions, _facts(recent_findings=found)).actions[0].severity
+
+    assert severity(_recent("src/a.py", severity="medium")) == "medium"
+    assert severity(_recent("src/a.py", severity="critical", kind="performance")) == "high"
+    assert severity(_recent("src/a.py", severity="low", kind="shape")) == "low"
 
 
 def test_fix_first_leaves_a_cause_the_week_added_to_fresh_regressions() -> None:
@@ -604,7 +636,15 @@ def test_coverage_stale_is_improve_signal() -> None:
     (a,) = _run(signal.coverage_stale, _facts(coverage=cov)).actions
     assert a.tier == "improve_signal"
     recent = CoverageState("stale", ANCHOR - timedelta(days=3), 40)
-    assert _run(signal.coverage_stale, _facts(coverage=recent)).actions == ()
+    outcome = _run(signal.coverage_stale, _facts(coverage=recent))
+    assert outcome.actions == ()
+    # Stale is one thing everywhere: measured at an earlier commit.
+    assert outcome.reason.startswith("Coverage was measured at an earlier commit;")
+    file = _file("src/a.py", line_coverage_pct=62.0)
+    (row,) = _run(code.fragile_file, _facts([file], coverage=recent)).actions
+    assert dict((w.label, w.value) for w in row.why)["line coverage"] == (
+        "62% (measured at an earlier commit)"
+    )
 
 
 def test_decisions_unreviewed_is_improve_signal() -> None:
@@ -872,9 +912,10 @@ def test_fragile_reached_by_tests_without_a_lead_is_silent() -> None:
     assert out.actions == ()
 
 
-def test_fragile_no_test_reaches_says_add_tests() -> None:
+def test_fragile_no_test_reaches_states_graph_absence_not_untested() -> None:
     (a,) = _run(code.fragile_file, _facts([_file("src/a.py", tests_reaching=0)])).actions
-    assert a.title.startswith("Add tests around `src/a.py`")
+    assert a.title.startswith("No test reaches `src/a.py` in the code graph")
+    assert "Add tests" not in a.title
     reach = next(w for w in a.why if w.label == "tests that reach it")
     assert (reach.value, reach.basis) == ("None in the code graph", "inferred")
 
@@ -894,7 +935,7 @@ def test_fragile_unknown_reach_is_not_zero() -> None:
     facts = _facts([unknown], unavailable={"test_map": "Not in this index yet."})
     assert _run(code.fragile_file, facts).actions == ()
     (zero,) = _run(code.fragile_file, _facts([replace(unknown, tests_reaching=0)])).actions
-    assert zero.title.startswith("Add tests around")
+    assert zero.title.startswith("No test reaches")
 
 
 def test_an_anonymous_lead_function_is_left_out_of_the_title() -> None:
@@ -947,7 +988,7 @@ def test_history_at_the_busy_floor_or_uncounted_is_not_flagged() -> None:
 
 def _dead_row(path: str) -> dict:
     return {"id": path, "kind": "unused_export", "file_path": path, "symbol_name": "old",
-            "lines": 5, "safe_to_delete": True, "status": "open"}
+            "lines": 5, "confidence": 0.9, "safe_to_delete": True, "status": "open"}
 
 
 def test_dead_code_actions_skip_tests_by_the_shared_classifier() -> None:
